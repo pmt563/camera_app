@@ -1,27 +1,29 @@
-# Use official Python base image
-FROM docker.io/library/python:3.10-slim
+# Use an official lightweight Python image
+FROM python:3.10-slim
 
-# Install dependencies required by OpenCV
+# Install system dependencies, including ffmpeg and libraries needed by OpenCV
 RUN apt-get update && apt-get install -y \
-    libglib2.0-0 \
-    libsm6 \
-    libxrender1 \
-    libxext6 \
-    libopencv-dev \
     ffmpeg \
+    libsm6 \
+    libxext6 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Copy application code
-COPY app/ /app/
+# Copy requirements file (if you have one)
+# Or install dependencies directly
+COPY requirements.txt .
 
-# Install Python dependencies
+# Install python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose any necessary ports (e.g. if Kuksa uses gRPC server or web dashboard)
-EXPOSE 55555
+# Copy your app code and configs
+COPY . .
 
-# Command to run the application
-CMD ["python", "main.py"]
+# Expose any ports if necessary (not mandatory here)
+# EXPOSE 1883
+
+# Run the main script
+CMD ["python", "your_script_name.py"]
