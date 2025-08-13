@@ -27,7 +27,7 @@ MAX_RETRIES = 3
 SERVER_UPLOAD_URL = 'https://34.127.65.112:8000/upload'
 UPLOADED_TRACK_FILE = 'uploaded_folders.json'
 
-KUKSA_HOST = "localhost"
+KUKSA_HOST = "HnR"
 KUKSA_PORT = 55555
 
 MQTT_BROKER = "34.127.65.112"
@@ -64,6 +64,10 @@ stop_queue = queue.Queue(1)
 active_cameras = {}
 camera_status = {cam: 0 for cam in CAMERA_PATHS}
 session_dir_var = {"path": None}
+
+# Stage flag and lock
+upload_stage_active = False
+upload_stage_lock = threading.Lock()
 
 # === Conversion Thread Pool ===
 conversion_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
@@ -231,20 +235,9 @@ def upload_folder(folder_path, folder_name, uploaded_folders, client):
     else:
         print(f"[ERROR] No WebM videos uploaded from {folder_name}")
 
-def uploader_thread():
-    uploaded_folders = load_uploaded_folders()
-    with VSSClient(KUKSA_HOST, KUKSA_PORT) as client:
-        for updates in client.subscribe_current_values([UPLOAD_STAGE_PATH]):
-            datapoint = updates.get(UPLOAD_STAGE_PATH)
-            if datapoint and datapoint.value == 1:
-                folder_path = session_dir_var["path"]
-                if folder_path:
-                    folder_name = os.path.basename(folder_path)
-                    print(f"[TRIGGER] Upload signal for {folder_name}")
-                    upload_folder(folder_path, folder_name, uploaded_folders, client)
-
 # === Camera Threads ===
 def monitor_camera_status_blocking():
+    global upload_stage_active
     with VSSClient(KUKSA_HOST, KUKSA_PORT) as client:
         for updates in client.subscribe_current_values(CAMERA_PATHS.values()):
             for path, datapoint in updates.items():
@@ -264,100 +257,156 @@ def monitor_camera_status_blocking():
                         cap = cv2.VideoCapture(camera_index[cam], cv2.CAP_DSHOW)
                         time.sleep(0.2)
                         if cap.isOpened():
-                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
                             active_cameras[cam] = cap
                             camera_status[cam] = new_status
+                            print(f"[CAMERA] Opened {cam}")
+                        else:
+                            print(f"[ERROR] Cannot open camera {cam}")
+                else:
+                    camera_status[cam] = new_status
+
+            # Subscribe and check upload stage
+            stage_dp = client.get_current_values([UPLOAD_STAGE_PATH]).get(UPLOAD_STAGE_PATH)
+            if stage_dp is not None:
+                with upload_stage_lock:
+                    upload_stage_active = (int(stage_dp.value) == 1)
+
+            # Stop check
+            if not stop_queue.empty() and stop_queue.get():
+                print("[THREAD] Monitor camera exiting")
+                break
+
+def uploader_thread():
+    global upload_stage_active
+    with VSSClient(KUKSA_HOST, KUKSA_PORT) as client:
+        for updates in client.subscribe_current_values([UPLOAD_STAGE_PATH]):
+            datapoint = updates.get(UPLOAD_STAGE_PATH)
+            if datapoint is not None:
+                with upload_stage_lock:
+                    upload_stage_active = (int(datapoint.value) == 1)
+                print(f"[STAGE] Upload stage flag set to {upload_stage_active}")
 
 def camera_record():
+    global upload_stage_active
     writers = {}
     current_session_dir = None
     video_files = {}
+    uploaded_folders = load_uploaded_folders()
 
-    while True:
-        any_camera_on = any(status in (1, 2) for status in camera_status.values())
+    with VSSClient(KUKSA_HOST, KUKSA_PORT) as client:
+        while True:
+            any_camera_on = any(status in (1, 2) for status in camera_status.values())
 
-        if current_session_dir is None and any_camera_on:
-            session_name = datetime.now().strftime(format_video_file)
-            current_session_dir = os.path.join(WATCH_FOLDER, session_name)
-            session_dir_var["path"] = current_session_dir
-            os.makedirs(current_session_dir, exist_ok=True)
-            for cam in CAMERA_PATHS:
-                os.makedirs(os.path.join(current_session_dir, cam), exist_ok=True)
+            if current_session_dir is None and any_camera_on:
+                session_name = datetime.now().strftime(format_video_file)
+                current_session_dir = os.path.join(WATCH_FOLDER, session_name)
+                session_dir_var["path"] = current_session_dir
+                os.makedirs(current_session_dir, exist_ok=True)
+                for cam in CAMERA_PATHS:
+                    os.makedirs(os.path.join(current_session_dir, cam), exist_ok=True)
 
-        if current_session_dir and not any_camera_on:
-            for cam, writer in writers.items():
-                try:
-                    writer.release()
-                    print(f"[VIDEO] Closed MP4 for {cam}")
-                    start_conversion_async(video_files[cam])
-                except Exception as e:
-                    print(f"[ERROR] Closing writer for {cam}: {e}")
-            writers.clear()
-            video_files.clear()
-            current_session_dir = None
-            session_dir_var["path"] = None
-
-        for cam, cap in list(active_cameras.items()):
-            if camera_status[cam] in (1, 2) and current_session_dir:
-                cam_dir = os.path.join(current_session_dir, cam)
-                if cam not in writers:
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    file_path = f'{cam_dir}/{cam}_{timestamp}.mp4'
-                    writer = cv2.VideoWriter(file_path, fourcc, 30.0, resolution)
-                    if writer.isOpened():
-                        writers[cam] = writer
-                        video_files[cam] = file_path
-                        print(f"[VIDEO] Recording MP4: {file_path}")
-                    else:
-                        print(f"[ERROR] Cannot open writer for {cam}")
-                        continue
-                ret, frame = cap.read()
-                if ret:
+            if current_session_dir and not any_camera_on:
+                # Close writers
+                for cam, writer in writers.items():
                     try:
-                        frame = cv2.resize(frame, resolution)
-                        ts = datetime.now().strftime(f'%Y:%m:%d %H:%M:%S {cam}')
-                        size = cv2.getTextSize(ts, cv2.FONT_HERSHEY_COMPLEX, 0.5, 2)[0]
-                        cv2.putText(frame, ts, (10, size[1] + 10), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0,), 2)
-                        cv2.putText(frame, ts, (10, size[1] + 10), cv2.FONT_HERSHEY_COMPLEX, 0.5, (255, 255, 255), 1)
-                        writers[cam].write(frame)
+                        writer.release()
+                        print(f"[VIDEO] Closed MP4 for {cam}")
+                        # Start async conversion
+                        start_conversion_async(video_files[cam])
                     except Exception as e:
-                        print(f"[ERROR] Writing frame for {cam}: {e}")
-            elif cam in writers:
-                try:
-                    writers[cam].release()
-                    print(f"[VIDEO] Closed MP4 for {cam}")
-                    start_conversion_async(video_files[cam])
-                    del writers[cam]
-                    del video_files[cam]
-                except Exception as e:
-                    print(f"[ERROR] Closing writer for {cam}: {e}")
+                        print(f"[ERROR] Closing writer for {cam}: {e}")
+                writers.clear()
 
-        if not stop_queue.empty() and stop_queue.get():
-            for cam, writer in writers.items():
-                try:
-                    writer.release()
-                    print(f"[VIDEO] Closed MP4 for {cam}")
-                    start_conversion_async(video_files[cam])
-                except Exception as e:
-                    print(f"[ERROR] Closing writer for {cam}: {e}")
-            writers.clear()
-            video_files.clear()
-            for cam in list(active_cameras.keys()):
-                active_cameras[cam].release()
-            active_cameras.clear()
-            break
+                # Wait for all conversions if stage active
+                with upload_stage_lock:
+                    if upload_stage_active:
+                        print("[UPLOAD FLOW] Stage active and camera off. Waiting for conversions...")
+                        for future in conversion_futures.values():
+                            future.result()  # wait all conversions done
+                        folder_path = current_session_dir
+                        folder_name = os.path.basename(folder_path)
+                        upload_folder(folder_path, folder_name, uploaded_folders, client)
+                        upload_stage_active = False
+                        print("[UPLOAD FLOW] Upload completed, stage flag reset.")
 
-        time.sleep(0.03)
+                video_files.clear()
+                current_session_dir = None
+                session_dir_var["path"] = None
+
+            # Record video frames while camera is on
+            for cam, cap in list(active_cameras.items()):
+                if camera_status[cam] in (1, 2) and current_session_dir:
+                    cam_dir = os.path.join(current_session_dir, cam)
+                    if cam not in writers:
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        file_path = f'{cam_dir}/{cam}_{timestamp}.mp4'
+                        writer = cv2.VideoWriter(file_path, fourcc, 30.0, resolution)
+                        if writer.isOpened():
+                            writers[cam] = writer
+                            video_files[cam] = file_path
+                            print(f"[VIDEO] Recording MP4: {file_path}")
+                        else:
+                            print(f"[ERROR] Cannot open writer for {cam}")
+                            continue
+                    ret, frame = cap.read()
+                    if ret:
+                        try:
+                            frame = cv2.resize(frame, resolution)
+                            ts = datetime.now().strftime(f'%Y:%m:%d %H:%M:%S {cam}')
+                            size = cv2.getTextSize(ts, cv2.FONT_HERSHEY_COMPLEX, 0.5, 2)[0]
+                            cv2.putText(frame, ts, (10, size[1] + 10), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0,), 2)
+                            cv2.putText(frame, ts, (10, size[1] + 10), cv2.FONT_HERSHEY_COMPLEX, 0.5, (255, 255, 255), 1)
+                            writers[cam].write(frame)
+                        except Exception as e:
+                            print(f"[ERROR] Writing frame for {cam}: {e}")
+                elif cam in writers:
+                    try:
+                        writers[cam].release()
+                        print(f"[VIDEO] Closed MP4 for {cam}")
+                        start_conversion_async(video_files[cam])
+                        del writers[cam]
+                        del video_files[cam]
+                    except Exception as e:
+                        print(f"[ERROR] Closing writer for {cam}: {e}")
+
+            if not stop_queue.empty() and stop_queue.get():
+                for cam, writer in writers.items():
+                    try:
+                        writer.release()
+                        print(f"[VIDEO] Closed MP4 for {cam}")
+                        start_conversion_async(video_files[cam])
+                    except Exception as e:
+                        print(f"[ERROR] Closing writer for {cam}: {e}")
+                writers.clear()
+                video_files.clear()
+                for cam in list(active_cameras.keys()):
+                    active_cameras[cam].release()
+                active_cameras.clear()
+                print("[THREAD] Camera record thread exiting.")
+                break
+
+            time.sleep(0.03)
 
 # === Main ===
 def main():
-    os.makedirs(WATCH_FOLDER, exist_ok=True)
-    threading.Thread(target=monitor_camera_status_blocking, daemon=True).start()
-    threading.Thread(target=camera_record, daemon=True).start()
-    threading.Thread(target=uploader_thread, daemon=True).start()
-    while True:
-        time.sleep(1)
+    monitor_thread = threading.Thread(target=monitor_camera_status_blocking, daemon=True)
+    uploader_flag_thread = threading.Thread(target=uploader_thread, daemon=True)
+    record_thread = threading.Thread(target=camera_record, daemon=True)
+
+    monitor_thread.start()
+    uploader_flag_thread.start()
+    record_thread.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("[MAIN] KeyboardInterrupt received, stopping threads...")
+        stop_queue.put(True)
+        record_thread.join()
+        monitor_thread.join()
+        uploader_flag_thread.join()
+        print("[MAIN] All threads stopped.")
 
 if __name__ == "__main__":
     main()

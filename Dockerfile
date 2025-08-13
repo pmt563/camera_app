@@ -26,4 +26,4 @@ COPY . .
 # EXPOSE 1883
 
 # Run the main script
-CMD ["python", "your_script_name.py"]
+CMD ["python", "hit_and_run_camera-kuksa.py"]

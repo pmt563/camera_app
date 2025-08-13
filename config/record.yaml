@@ -9,6 +9,6 @@ resolution:
   width: 600
 
 base_directory: video
-maximum_video_time: 20
+maximum_video_time: 15
 format_video:
   "AUTONXT_%Y%m%d_%H%M%S"
