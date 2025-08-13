@@ -4,6 +4,7 @@ import yaml
 import json
 import time
 import queue
+import shutil
 import threading
 import requests
 import urllib3
@@ -69,28 +70,45 @@ session_dir_var = {"path": None}
 upload_stage_active = False
 upload_stage_lock = threading.Lock()
 
-# === Conversion Thread Pool ===
+# === Conversion Thread Pool & ffmpeg discovery ===
 conversion_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 conversion_futures = {}
-FFMPEG_PATH = r"C:\ProgramData\chocolatey\bin\ffmpeg.exe"  # Adjust if needed
+
+# Find ffmpeg in PATH (Linux apt install puts it here)
+FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"  # fallback to name; will error if truly missing
+
 
 def convert_to_webm(mp4_path):
-    """Convert MP4 to WebM using ffmpeg (keeps both) and wait until ready."""
+    """Convert MP4 to WebM using ffmpeg (keeps both) and wait until ready)."""
     webm_path = os.path.splitext(mp4_path)[0] + ".webm"
-    FFMPEG_PATH = r"C:\ProgramData\chocolatey\bin\ffmpeg.exe"  # choco install path
+
+    if not shutil.which(FFMPEG_BIN):
+        print("[ERROR] ffmpeg not found in PATH. Install it with:")
+        print("       sudo apt update && sudo apt install ffmpeg")
+        return None
 
     print(f"[CONVERT] Starting: {mp4_path} -> {webm_path}")
 
     try:
         subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", mp4_path, "-c:v", "libvpx", "-b:v", "1M",
-             "-c:a", "libvorbis", webm_path],
-            check=True
+            [
+                FFMPEG_BIN,
+                "-y",
+                "-i", mp4_path,
+                "-c:v", "libvpx-vp9",
+                "-b:v", "1M",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "libopus",
+                webm_path,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+
         # Wait until file exists and has size > 0
         start_time = time.time()
-        while (not os.path.exists(webm_path) or os.path.getsize(webm_path) == 0) \
-                and time.time() - start_time < 10:
+        while (not os.path.exists(webm_path) or os.path.getsize(webm_path) == 0) and time.time() - start_time < 10:
             print(f"[WAIT] Waiting for conversion of {os.path.basename(mp4_path)}...")
             time.sleep(0.5)
 
@@ -100,10 +118,12 @@ def convert_to_webm(mp4_path):
         else:
             print(f"[ERROR] Conversion did not produce valid file: {webm_path}")
     except FileNotFoundError:
-        print(f"[ERROR] ffmpeg not found at {FFMPEG_PATH}")
+        print(f"[ERROR] ffmpeg not found (checked '{FFMPEG_BIN}').")
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] ffmpeg conversion error: {e}")
+        err = e.stderr.decode(errors='ignore') if e.stderr else str(e)
+        print(f"[ERROR] ffmpeg conversion error: {e}\n--- stderr ---\n{err}")
     return None
+
 
 def start_conversion_async(mp4_path):
     """Submit a background conversion task."""
@@ -111,12 +131,12 @@ def start_conversion_async(mp4_path):
     conversion_futures[mp4_path] = future
     return future
 
+
 def wait_for_conversion(mp4_path):
     """Wait for a specific MP4 to finish converting before upload."""
     future = conversion_futures.get(mp4_path)
     if future:
         webm_path = future.result()  # Blocks until ffmpeg finishes
-        # Ensure file exists and is non-empty
         retries = 0
         while retries < 5:
             if webm_path and os.path.exists(webm_path) and os.path.getsize(webm_path) > 0:
@@ -125,6 +145,7 @@ def wait_for_conversion(mp4_path):
             time.sleep(1)
     return None
 
+
 # === Upload Helpers ===
 def load_uploaded_folders():
     if os.path.exists(UPLOADED_TRACK_FILE):
@@ -132,9 +153,11 @@ def load_uploaded_folders():
             return set(json.load(f))
     return set()
 
+
 def save_uploaded_folders(uploaded_set):
     with open(UPLOADED_TRACK_FILE, 'w') as f:
         json.dump(list(uploaded_set), f)
+
 
 def publish_timestamp():
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -144,13 +167,39 @@ def publish_timestamp():
     except Exception as e:
         print(f"[ERROR] MQTT publish failed: {e}")
 
+
 def get_videos_in_folder(folder_path):
-    videos = []
+    """
+    Return ONE entry per video 'stem' (basename without extension).
+    Prefer .webm if it exists; otherwise use .mp4. Sorted by mtime.
+    """
+    by_stem = {}  # stem -> (name, fullpath)
     for root, _, files in os.walk(folder_path):
         for file in files:
-            if file.lower().endswith(VIDEO_EXTENSIONS):
-                videos.append((file, os.path.join(root, file)))
-    return sorted(videos, key=lambda x: os.path.getmtime(x[1]))
+            low = file.lower()
+            if low.endswith(".mp4") or low.endswith(".webm"):
+                stem, _ext = os.path.splitext(file)
+                full = os.path.join(root, file)
+                chosen = by_stem.get(stem)
+
+                if chosen is None:
+                    by_stem[stem] = (file, full)
+                else:
+                    _, existing_full = chosen
+                    # Prefer .webm when both exist
+                    if low.endswith(".webm"):
+                        by_stem[stem] = (file, full)
+                    elif existing_full.lower().endswith(".webm"):
+                        pass  # keep existing .webm
+                    else:
+                        # both .mp4 — keep newer one
+                        if os.path.getmtime(full) > os.path.getmtime(existing_full):
+                            by_stem[stem] = (file, full)
+
+    items = list(by_stem.values())
+    items.sort(key=lambda x: os.path.getmtime(x[1]))
+    return items  # [(name, fullpath), ...]
+
 
 def upload_video(full_path, video_name, client):
     retries = 0
@@ -191,6 +240,7 @@ def upload_video(full_path, video_name, client):
     print(f"[ERROR] Failed to upload {video_name} after {MAX_RETRIES} attempts")
     return False
 
+
 def upload_folder(folder_path, folder_name, uploaded_folders, client):
     if folder_name in uploaded_folders:
         print(f"[SKIP] Folder {folder_name} already uploaded.")
@@ -212,8 +262,8 @@ def upload_folder(folder_path, folder_name, uploaded_folders, client):
 
     upload_count = 0
     for video_name, full_path in videos:
-        if full_path.endswith(".mp4"):
-            # Convert before uploading
+        # If only MP4 exists, convert once; if WEBM exists, just upload it.
+        if full_path.lower().endswith(".mp4"):
             webm_path = convert_to_webm(full_path)
             if not webm_path:
                 print(f"[ERROR] Skipping upload for {video_name} (conversion failed)")
@@ -221,7 +271,7 @@ def upload_folder(folder_path, folder_name, uploaded_folders, client):
             full_path = webm_path
             video_name = os.path.basename(webm_path)
 
-        if full_path.endswith(".webm"):
+        if full_path.lower().endswith(".webm"):
             if os.path.exists(full_path) and os.path.getsize(full_path) > 0:
                 if upload_video(full_path, video_name, client):
                     upload_count += 1
@@ -235,9 +285,10 @@ def upload_folder(folder_path, folder_name, uploaded_folders, client):
     else:
         print(f"[ERROR] No WebM videos uploaded from {folder_name}")
 
+
 # === Camera Threads ===
 def monitor_camera_status_blocking():
-    global upload_stage_active
+    """Only handle camera status here. Do NOT touch Upload.Stage here."""
     with VSSClient(KUKSA_HOST, KUKSA_PORT) as client:
         for updates in client.subscribe_current_values(CAMERA_PATHS.values()):
             for path, datapoint in updates.items():
@@ -254,8 +305,8 @@ def monitor_camera_status_blocking():
                     camera_status[cam] = 0
                 elif new_status in (1, 2):
                     if cam not in active_cameras:
-                        cap = cv2.VideoCapture(camera_index[cam], cv2.CAP_DSHOW)
-                        time.sleep(0.2)
+                        cap = cv2.VideoCapture(camera_index[cam], cv2.CAP_V4L2)
+                        time.sleep(2)  # allow device settle
                         if cap.isOpened():
                             active_cameras[cam] = cap
                             camera_status[cam] = new_status
@@ -265,26 +316,31 @@ def monitor_camera_status_blocking():
                 else:
                     camera_status[cam] = new_status
 
-            # Subscribe and check upload stage
-            stage_dp = client.get_current_values([UPLOAD_STAGE_PATH]).get(UPLOAD_STAGE_PATH)
-            if stage_dp is not None:
-                with upload_stage_lock:
-                    upload_stage_active = (int(stage_dp.value) == 1)
-
             # Stop check
             if not stop_queue.empty() and stop_queue.get():
                 print("[THREAD] Monitor camera exiting")
                 break
 
+
 def uploader_thread():
+    """Edge-triggered watcher for Upload.Stage (0->1 only)."""
     global upload_stage_active
+    last_stage_val = 0
     with VSSClient(KUKSA_HOST, KUKSA_PORT) as client:
         for updates in client.subscribe_current_values([UPLOAD_STAGE_PATH]):
-            datapoint = updates.get(UPLOAD_STAGE_PATH)
-            if datapoint is not None:
+            dp = updates.get(UPLOAD_STAGE_PATH)
+            if dp is None:
+                continue
+            val = int(dp.value)
+
+            # Rising edge detection: 0 -> 1
+            if last_stage_val == 0 and val == 1:
                 with upload_stage_lock:
-                    upload_stage_active = (int(datapoint.value) == 1)
-                print(f"[STAGE] Upload stage flag set to {upload_stage_active}")
+                    upload_stage_active = True
+                print("[STAGE] Rising edge detected -> start upload flow")
+
+            last_stage_val = val
+
 
 def camera_record():
     global upload_stage_active
@@ -307,12 +363,11 @@ def camera_record():
 
             if current_session_dir and not any_camera_on:
                 # Close writers
-                for cam, writer in writers.items():
+                for cam, writer in list(writers.items()):
                     try:
                         writer.release()
                         print(f"[VIDEO] Closed MP4 for {cam}")
-                        # Start async conversion
-                        start_conversion_async(video_files[cam])
+                        start_conversion_async(video_files[cam])  # Start async conversion
                     except Exception as e:
                         print(f"[ERROR] Closing writer for {cam}: {e}")
                 writers.clear()
@@ -321,11 +376,21 @@ def camera_record():
                 with upload_stage_lock:
                     if upload_stage_active:
                         print("[UPLOAD FLOW] Stage active and camera off. Waiting for conversions...")
-                        for future in conversion_futures.values():
+                        for future in list(conversion_futures.values()):
                             future.result()  # wait all conversions done
+                        conversion_futures.clear()
+
                         folder_path = current_session_dir
                         folder_name = os.path.basename(folder_path)
                         upload_folder(folder_path, folder_name, uploaded_folders, client)
+
+                        # Reset stage in KUKSA and locally so it won't retrigger
+                        try:
+                            client.set_current_values({UPLOAD_STAGE_PATH: Datapoint(0)})
+                            print("[STAGE] Reset Upload.Stage to 0")
+                        except Exception as e:
+                            print(f"[WARN] Failed to reset Upload.Stage: {e}")
+
                         upload_stage_active = False
                         print("[UPLOAD FLOW] Upload completed, stage flag reset.")
 
@@ -370,7 +435,7 @@ def camera_record():
                         print(f"[ERROR] Closing writer for {cam}: {e}")
 
             if not stop_queue.empty() and stop_queue.get():
-                for cam, writer in writers.items():
+                for cam, writer in list(writers.items()):
                     try:
                         writer.release()
                         print(f"[VIDEO] Closed MP4 for {cam}")
@@ -386,6 +451,7 @@ def camera_record():
                 break
 
             time.sleep(0.03)
+
 
 # === Main ===
 def main():
@@ -408,5 +474,7 @@ def main():
         uploader_flag_thread.join()
         print("[MAIN] All threads stopped.")
 
+
 if __name__ == "__main__":
     main()
+
