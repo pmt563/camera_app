@@ -1,4 +1,11 @@
-# Use an official lightweight Python image
+FROM --platform=$TARGETPLATFORM python:3.12-slim AS builder
+
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+
+RUN echo "-- Running on $BUILDPLATFORM, building for $TARGETPLATFORM"
+
+# Stage 2: Actual application image
 FROM python:3.12-slim
 
 # Install system dependencies, including ffmpeg and libraries needed by OpenCV
@@ -12,17 +19,16 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements file (if you have one)
-# Or install dependencies directly
+# Copy requirements file
 COPY requirements.txt .
 
-# Install python dependencies
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy your app code and configs
 COPY . .
 
-# Expose any ports if necessary (not mandatory here)
+# Expose ports if necessary
 # EXPOSE 1883
 
 # Run the main script
